@@ -29,7 +29,7 @@ var _ = Describe("NftablesFirewall", func() {
 		fakeConn = &firewallfakes.FakeNftablesConn{}
 		fakeResolver = &firewallfakes.FakeDNSResolver{}
 		logger = boshlog.NewWriterLogger(boshlog.LevelDebug, GinkgoWriter)
-		manager = firewall.NewNftablesFirewallWithDeps(fakeConn, fakeResolver, logger)
+		manager = firewall.NewNftablesFirewallWithDeps(fakeConn, fakeResolver, logger, firewall.Options{})
 
 		// Default: GetRules returns empty (no existing rules)
 		fakeConn.GetRulesReturns([]*nftables.Rule{}, nil)
@@ -296,6 +296,22 @@ var _ = Describe("NftablesFirewall", func() {
 				err := manager.SetupMonitFirewall()
 				Expect(err).To(HaveOccurred())
 				Expect(err.Error()).To(ContainSubstring("Flushing nftables rules"))
+			})
+		})
+
+		Context("with AllowVcapMonitAccess enabled", func() {
+			Context("when vcap user does not exist", func() {
+				BeforeEach(func() {
+					manager = firewall.NewNftablesFirewallWithDeps(fakeConn, fakeResolver, logger, firewall.Options{
+						AllowVcapMonitAccess: true,
+					})
+				})
+
+				It("returns an error when vcap user cannot be found", func() {
+					err := manager.SetupMonitFirewall()
+					Expect(err).To(HaveOccurred())
+					Expect(err.Error()).To(ContainSubstring("Looking up vcap user"))
+				})
 			})
 		})
 	})

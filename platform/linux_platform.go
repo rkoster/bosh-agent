@@ -90,6 +90,11 @@ type LinuxOptions struct {
 	// example: "pattern": "^(disk-.+)$", "replacement": "google-${1}",
 	DiskIDTransformPattern     string
 	DiskIDTransformReplacement string
+
+	// When set to true, the vcap user (in addition to root) is allowed to access monit.
+	// This is needed for backward compatibility with releases like pxc-release that have
+	// job processes (running as vcap) that need to query monit.
+	AllowVcapMonitAccess bool
 }
 
 type linux struct {
@@ -1806,7 +1811,10 @@ func prepareDiskLabelPrefix(labelPrefix string) string {
 // SetupFirewall initializes the nftables-based firewall for protecting monit and NATS.
 // This should be called during platform setup, before NATS connections are attempted.
 func (p *linux) SetupFirewall() error {
-	mgr, err := firewall.NewNftablesFirewall(p.logger)
+	opts := firewall.Options{
+		AllowVcapMonitAccess: p.options.AllowVcapMonitAccess,
+	}
+	mgr, err := firewall.NewNftablesFirewall(p.logger, opts)
 	if err != nil {
 		p.logger.Warn(logTag, "Failed to create firewall manager: %s", err)
 		// Not a fatal error - continue without firewall protection

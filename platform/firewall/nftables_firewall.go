@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net"
 	gonetURL "net/url"
+	"os/user"
 	"reflect"
 	"strconv"
 	"strings"
@@ -101,6 +102,7 @@ type NftablesFirewall struct {
 	resolver       DNSResolver
 	logger         boshlog.Logger
 	logTag         string
+	options        Options
 	table          *nftables.Table
 	monitChain     *nftables.Chain
 	monitJobsChain *nftables.Chain
@@ -108,7 +110,7 @@ type NftablesFirewall struct {
 }
 
 // NewNftablesFirewall creates a new nftables-based firewall manager
-func NewNftablesFirewall(logger boshlog.Logger) (Manager, error) {
+func NewNftablesFirewall(logger boshlog.Logger, options Options) (Manager, error) {
 	conn, err := nftables.New()
 	if err != nil {
 		return nil, bosherr.WrapError(err, "Creating nftables connection")
@@ -118,16 +120,18 @@ func NewNftablesFirewall(logger boshlog.Logger) (Manager, error) {
 		&realNftablesConn{conn: conn},
 		&realDNSResolver{},
 		logger,
+		options,
 	), nil
 }
 
 // NewNftablesFirewallWithDeps creates a firewall manager with injected dependencies (for testing)
-func NewNftablesFirewallWithDeps(conn NftablesConn, resolver DNSResolver, logger boshlog.Logger) Manager {
+func NewNftablesFirewallWithDeps(conn NftablesConn, resolver DNSResolver, logger boshlog.Logger, options Options) Manager {
 	return &NftablesFirewall{
 		conn:     conn,
 		resolver: resolver,
 		logger:   logger,
 		logTag:   "NftablesFirewall",
+		options:  options,
 	}
 }
 
@@ -294,7 +298,10 @@ func (f *NftablesFirewall) convergeMonitRules() error {
 	}
 
 	// Build desired state
-	desired := f.buildDesiredMonitRules()
+	desired, err := f.buildDesiredMonitRules()
+	if err != nil {
+		return err
+	}
 
 	// Separate agent rules from job rules
 	var agentRules []*nftables.Rule
@@ -348,22 +355,40 @@ func (f *NftablesFirewall) convergeMonitRules() error {
 // The order is:
 //  1. Jump to monit_output_jobs chain (so job rules are checked first)
 //  2. Allow UID 0 (root) access
-//  3. Drop all other access (at end)
-func (f *NftablesFirewall) buildDesiredMonitRules() []desiredRule {
-	return []desiredRule{
+//  3. Allow vcap UID access (if AllowVcapMonitAccess is enabled)
+//  4. Drop all other access (at end)
+func (f *NftablesFirewall) buildDesiredMonitRules() ([]desiredRule, error) {
+	rules := []desiredRule{
 		{
 			exprs:    f.buildJumpToJobsChainExprs(),
 			position: "first",
 		},
 		{
-			exprs:    f.buildMonitAllowExprs(),
+			exprs:    f.buildMonitAllowExprs(0), // root UID
 			position: "first",
 		},
-		{
-			exprs:    f.buildMonitBlockExprs(),
-			position: "last",
-		},
 	}
+
+	// Add vcap allow rule if configured
+	if f.options.AllowVcapMonitAccess {
+		vcapUID, err := lookupUID("vcap")
+		if err != nil {
+			return nil, bosherr.WrapError(err, "Looking up vcap user for monit firewall")
+		}
+		f.logger.Info(f.logTag, "Allowing vcap user (UID %d) access to monit", vcapUID)
+		rules = append(rules, desiredRule{
+			exprs:    f.buildMonitAllowExprs(vcapUID),
+			position: "first",
+		})
+	}
+
+	// Drop rule always goes last
+	rules = append(rules, desiredRule{
+		exprs:    f.buildMonitBlockExprs(),
+		position: "last",
+	})
+
+	return rules, nil
 }
 
 // buildJumpToJobsChainExprs creates expressions for jumping to the jobs chain
@@ -376,9 +401,9 @@ func (f *NftablesFirewall) buildJumpToJobsChainExprs() []expr.Any {
 	}
 }
 
-// buildMonitAllowExprs creates expressions for allowing UID 0 access to monit
-func (f *NftablesFirewall) buildMonitAllowExprs() []expr.Any {
-	exprs := f.buildUIDMatchExprs(0)
+// buildMonitAllowExprs creates expressions for allowing a specific UID access to monit
+func (f *NftablesFirewall) buildMonitAllowExprs(uid uint32) []expr.Any {
+	exprs := f.buildUIDMatchExprs(uid)
 	exprs = append(exprs, f.buildLoopbackDestExprs()...)
 	exprs = append(exprs, f.buildTCPDestPortExprs(MonitPort)...)
 	exprs = append(exprs, &expr.Verdict{Kind: expr.VerdictAccept})
@@ -641,4 +666,17 @@ func parseNATSURL(mbusURL string) (string, int, error) {
 	}
 
 	return host, port, nil
+}
+
+// lookupUID looks up a user by name and returns their UID as uint32
+func lookupUID(username string) (uint32, error) {
+	u, err := user.Lookup(username)
+	if err != nil {
+		return 0, err
+	}
+	uid, err := strconv.ParseUint(u.Uid, 10, 32)
+	if err != nil {
+		return 0, fmt.Errorf("parsing UID for user %s: %w", username, err)
+	}
+	return uint32(uid), nil
 }

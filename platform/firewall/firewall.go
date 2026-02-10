@@ -37,3 +37,11 @@ type NatsFirewallHook interface {
 	// It resolves the NATS URL and updates firewall rules with the resolved IP.
 	BeforeConnect(mbusURL string) error
 }
+
+// Options configures firewall behavior.
+type Options struct {
+	// AllowVcapMonitAccess when true allows the vcap user (in addition to root)
+	// to access monit. This is needed for backward compatibility with releases
+	// like pxc-release that have job processes running as vcap that query monit.
+	AllowVcapMonitAccess bool
+}

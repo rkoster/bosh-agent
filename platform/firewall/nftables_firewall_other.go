@@ -9,6 +9,6 @@ import (
 )
 
 // NewNftablesFirewall returns an error on non-Linux platforms
-func NewNftablesFirewall(logger boshlog.Logger) (Manager, error) {
+func NewNftablesFirewall(logger boshlog.Logger, options Options) (Manager, error) {
 	return nil, errors.New("nftables firewall is only supported on Linux")
 }
