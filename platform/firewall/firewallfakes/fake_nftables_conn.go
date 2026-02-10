@@ -44,6 +44,17 @@ type FakeNftablesConn struct {
 	addTableReturnsOnCall map[int]struct {
 		result1 *nftables.Table
 	}
+	DelRuleStub        func(*nftables.Rule) error
+	delRuleMutex       sync.RWMutex
+	delRuleArgsForCall []struct {
+		arg1 *nftables.Rule
+	}
+	delRuleReturns struct {
+		result1 error
+	}
+	delRuleReturnsOnCall map[int]struct {
+		result1 error
+	}
 	FlushStub        func() error
 	flushMutex       sync.RWMutex
 	flushArgsForCall []struct {
@@ -58,6 +69,31 @@ type FakeNftablesConn struct {
 	flushChainMutex       sync.RWMutex
 	flushChainArgsForCall []struct {
 		arg1 *nftables.Chain
+	}
+	GetRulesStub        func(*nftables.Table, *nftables.Chain) ([]*nftables.Rule, error)
+	getRulesMutex       sync.RWMutex
+	getRulesArgsForCall []struct {
+		arg1 *nftables.Table
+		arg2 *nftables.Chain
+	}
+	getRulesReturns struct {
+		result1 []*nftables.Rule
+		result2 error
+	}
+	getRulesReturnsOnCall map[int]struct {
+		result1 []*nftables.Rule
+		result2 error
+	}
+	InsertRuleStub        func(*nftables.Rule) *nftables.Rule
+	insertRuleMutex       sync.RWMutex
+	insertRuleArgsForCall []struct {
+		arg1 *nftables.Rule
+	}
+	insertRuleReturns struct {
+		result1 *nftables.Rule
+	}
+	insertRuleReturnsOnCall map[int]struct {
+		result1 *nftables.Rule
 	}
 	invocations      map[string][][]interface{}
 	invocationsMutex sync.RWMutex
@@ -246,6 +282,67 @@ func (fake *FakeNftablesConn) AddTableReturnsOnCall(i int, result1 *nftables.Tab
 	}{result1}
 }
 
+func (fake *FakeNftablesConn) DelRule(arg1 *nftables.Rule) error {
+	fake.delRuleMutex.Lock()
+	ret, specificReturn := fake.delRuleReturnsOnCall[len(fake.delRuleArgsForCall)]
+	fake.delRuleArgsForCall = append(fake.delRuleArgsForCall, struct {
+		arg1 *nftables.Rule
+	}{arg1})
+	stub := fake.DelRuleStub
+	fakeReturns := fake.delRuleReturns
+	fake.recordInvocation("DelRule", []interface{}{arg1})
+	fake.delRuleMutex.Unlock()
+	if stub != nil {
+		return stub(arg1)
+	}
+	if specificReturn {
+		return ret.result1
+	}
+	return fakeReturns.result1
+}
+
+func (fake *FakeNftablesConn) DelRuleCallCount() int {
+	fake.delRuleMutex.RLock()
+	defer fake.delRuleMutex.RUnlock()
+	return len(fake.delRuleArgsForCall)
+}
+
+func (fake *FakeNftablesConn) DelRuleCalls(stub func(*nftables.Rule) error) {
+	fake.delRuleMutex.Lock()
+	defer fake.delRuleMutex.Unlock()
+	fake.DelRuleStub = stub
+}
+
+func (fake *FakeNftablesConn) DelRuleArgsForCall(i int) *nftables.Rule {
+	fake.delRuleMutex.RLock()
+	defer fake.delRuleMutex.RUnlock()
+	argsForCall := fake.delRuleArgsForCall[i]
+	return argsForCall.arg1
+}
+
+func (fake *FakeNftablesConn) DelRuleReturns(result1 error) {
+	fake.delRuleMutex.Lock()
+	defer fake.delRuleMutex.Unlock()
+	fake.DelRuleStub = nil
+	fake.delRuleReturns = struct {
+		result1 error
+	}{result1}
+}
+
+func (fake *FakeNftablesConn) DelRuleReturnsOnCall(i int, result1 error) {
+	fake.delRuleMutex.Lock()
+	defer fake.delRuleMutex.Unlock()
+	fake.DelRuleStub = nil
+	if fake.delRuleReturnsOnCall == nil {
+		fake.delRuleReturnsOnCall = make(map[int]struct {
+			result1 error
+		})
+	}
+	fake.delRuleReturnsOnCall[i] = struct {
+		result1 error
+	}{result1}
+}
+
 func (fake *FakeNftablesConn) Flush() error {
 	fake.flushMutex.Lock()
 	ret, specificReturn := fake.flushReturnsOnCall[len(fake.flushArgsForCall)]
@@ -329,6 +426,132 @@ func (fake *FakeNftablesConn) FlushChainArgsForCall(i int) *nftables.Chain {
 	defer fake.flushChainMutex.RUnlock()
 	argsForCall := fake.flushChainArgsForCall[i]
 	return argsForCall.arg1
+}
+
+func (fake *FakeNftablesConn) GetRules(arg1 *nftables.Table, arg2 *nftables.Chain) ([]*nftables.Rule, error) {
+	fake.getRulesMutex.Lock()
+	ret, specificReturn := fake.getRulesReturnsOnCall[len(fake.getRulesArgsForCall)]
+	fake.getRulesArgsForCall = append(fake.getRulesArgsForCall, struct {
+		arg1 *nftables.Table
+		arg2 *nftables.Chain
+	}{arg1, arg2})
+	stub := fake.GetRulesStub
+	fakeReturns := fake.getRulesReturns
+	fake.recordInvocation("GetRules", []interface{}{arg1, arg2})
+	fake.getRulesMutex.Unlock()
+	if stub != nil {
+		return stub(arg1, arg2)
+	}
+	if specificReturn {
+		return ret.result1, ret.result2
+	}
+	return fakeReturns.result1, fakeReturns.result2
+}
+
+func (fake *FakeNftablesConn) GetRulesCallCount() int {
+	fake.getRulesMutex.RLock()
+	defer fake.getRulesMutex.RUnlock()
+	return len(fake.getRulesArgsForCall)
+}
+
+func (fake *FakeNftablesConn) GetRulesCalls(stub func(*nftables.Table, *nftables.Chain) ([]*nftables.Rule, error)) {
+	fake.getRulesMutex.Lock()
+	defer fake.getRulesMutex.Unlock()
+	fake.GetRulesStub = stub
+}
+
+func (fake *FakeNftablesConn) GetRulesArgsForCall(i int) (*nftables.Table, *nftables.Chain) {
+	fake.getRulesMutex.RLock()
+	defer fake.getRulesMutex.RUnlock()
+	argsForCall := fake.getRulesArgsForCall[i]
+	return argsForCall.arg1, argsForCall.arg2
+}
+
+func (fake *FakeNftablesConn) GetRulesReturns(result1 []*nftables.Rule, result2 error) {
+	fake.getRulesMutex.Lock()
+	defer fake.getRulesMutex.Unlock()
+	fake.GetRulesStub = nil
+	fake.getRulesReturns = struct {
+		result1 []*nftables.Rule
+		result2 error
+	}{result1, result2}
+}
+
+func (fake *FakeNftablesConn) GetRulesReturnsOnCall(i int, result1 []*nftables.Rule, result2 error) {
+	fake.getRulesMutex.Lock()
+	defer fake.getRulesMutex.Unlock()
+	fake.GetRulesStub = nil
+	if fake.getRulesReturnsOnCall == nil {
+		fake.getRulesReturnsOnCall = make(map[int]struct {
+			result1 []*nftables.Rule
+			result2 error
+		})
+	}
+	fake.getRulesReturnsOnCall[i] = struct {
+		result1 []*nftables.Rule
+		result2 error
+	}{result1, result2}
+}
+
+func (fake *FakeNftablesConn) InsertRule(arg1 *nftables.Rule) *nftables.Rule {
+	fake.insertRuleMutex.Lock()
+	ret, specificReturn := fake.insertRuleReturnsOnCall[len(fake.insertRuleArgsForCall)]
+	fake.insertRuleArgsForCall = append(fake.insertRuleArgsForCall, struct {
+		arg1 *nftables.Rule
+	}{arg1})
+	stub := fake.InsertRuleStub
+	fakeReturns := fake.insertRuleReturns
+	fake.recordInvocation("InsertRule", []interface{}{arg1})
+	fake.insertRuleMutex.Unlock()
+	if stub != nil {
+		return stub(arg1)
+	}
+	if specificReturn {
+		return ret.result1
+	}
+	return fakeReturns.result1
+}
+
+func (fake *FakeNftablesConn) InsertRuleCallCount() int {
+	fake.insertRuleMutex.RLock()
+	defer fake.insertRuleMutex.RUnlock()
+	return len(fake.insertRuleArgsForCall)
+}
+
+func (fake *FakeNftablesConn) InsertRuleCalls(stub func(*nftables.Rule) *nftables.Rule) {
+	fake.insertRuleMutex.Lock()
+	defer fake.insertRuleMutex.Unlock()
+	fake.InsertRuleStub = stub
+}
+
+func (fake *FakeNftablesConn) InsertRuleArgsForCall(i int) *nftables.Rule {
+	fake.insertRuleMutex.RLock()
+	defer fake.insertRuleMutex.RUnlock()
+	argsForCall := fake.insertRuleArgsForCall[i]
+	return argsForCall.arg1
+}
+
+func (fake *FakeNftablesConn) InsertRuleReturns(result1 *nftables.Rule) {
+	fake.insertRuleMutex.Lock()
+	defer fake.insertRuleMutex.Unlock()
+	fake.InsertRuleStub = nil
+	fake.insertRuleReturns = struct {
+		result1 *nftables.Rule
+	}{result1}
+}
+
+func (fake *FakeNftablesConn) InsertRuleReturnsOnCall(i int, result1 *nftables.Rule) {
+	fake.insertRuleMutex.Lock()
+	defer fake.insertRuleMutex.Unlock()
+	fake.InsertRuleStub = nil
+	if fake.insertRuleReturnsOnCall == nil {
+		fake.insertRuleReturnsOnCall = make(map[int]struct {
+			result1 *nftables.Rule
+		})
+	}
+	fake.insertRuleReturnsOnCall[i] = struct {
+		result1 *nftables.Rule
+	}{result1}
 }
 
 func (fake *FakeNftablesConn) Invocations() map[string][][]interface{} {

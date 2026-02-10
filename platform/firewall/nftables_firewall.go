@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net"
 	gonetURL "net/url"
+	"reflect"
 	"strconv"
 	"strings"
 
@@ -18,11 +19,15 @@ import (
 )
 
 const (
-	TableName          = "bosh_agent"
-	MonitChainName     = "monit_access"
-	MonitJobsChainName = "monit_access_jobs"
-	NATSChainName      = "nats_access"
+	// Table and chain names are chosen for backward compatibility with existing
+	// BOSH releases (e.g., pxc-release 1.1.9) that expect these specific names.
+	// See docs/backward-compatible-monit-firewall.md for details.
+	TableName          = "filter"
+	MonitChainName     = "monit_output"
+	MonitJobsChainName = "monit_output_jobs"
+	NATSChainName      = "nats_output"
 	MonitPort          = 2822
+	AgentRuleMarker    = "bosh-agent" // UserData marker for agent-managed rules
 )
 
 // NftablesConn abstracts the nftables connection for testing
@@ -32,6 +37,9 @@ type NftablesConn interface {
 	AddTable(t *nftables.Table) *nftables.Table
 	AddChain(c *nftables.Chain) *nftables.Chain
 	AddRule(r *nftables.Rule) *nftables.Rule
+	InsertRule(r *nftables.Rule) *nftables.Rule
+	GetRules(t *nftables.Table, c *nftables.Chain) ([]*nftables.Rule, error)
+	DelRule(r *nftables.Rule) error
 	FlushChain(c *nftables.Chain)
 	Flush() error
 }
@@ -65,6 +73,18 @@ func (r *realNftablesConn) AddChain(c *nftables.Chain) *nftables.Chain {
 
 func (r *realNftablesConn) AddRule(rule *nftables.Rule) *nftables.Rule {
 	return r.conn.AddRule(rule)
+}
+
+func (r *realNftablesConn) InsertRule(rule *nftables.Rule) *nftables.Rule {
+	return r.conn.InsertRule(rule)
+}
+
+func (r *realNftablesConn) GetRules(t *nftables.Table, c *nftables.Chain) ([]*nftables.Rule, error) {
+	return r.conn.GetRules(t, c)
+}
+
+func (r *realNftablesConn) DelRule(rule *nftables.Rule) error {
+	return r.conn.DelRule(rule)
 }
 
 func (r *realNftablesConn) FlushChain(c *nftables.Chain) {
@@ -113,14 +133,17 @@ func NewNftablesFirewallWithDeps(conn NftablesConn, resolver DNSResolver, logger
 
 // SetupMonitFirewall creates firewall rules to protect monit (port 2822).
 // Only root (UID 0) is allowed to connect by default.
-// Jobs can add their own access rules to the monit_access_jobs chain.
+// Jobs can add their own access rules to the monit_output_jobs chain or
+// insert rules directly into monit_output chain (for backward compatibility).
 //
 // Architecture:
-//   - monit_access_jobs: Regular chain for job-managed rules (never flushed by agent)
-//   - monit_access: Base chain with hook that jumps to jobs chain, then applies agent rules
+//   - monit_output_jobs: Regular chain for job-managed rules (never flushed by agent)
+//   - monit_output: Base chain with hook that jumps to jobs chain, then applies agent rules
 //
-// This allows job rules to persist across agent restarts while ensuring
-// agent rules are always up-to-date.
+// This implementation uses a declarative state converger that:
+//  1. Compares current rules against desired state
+//  2. Only modifies agent-managed rules (identified by UserData marker)
+//  3. Preserves rules inserted by jobs (e.g., pxc-release galera-agent)
 func (f *NftablesFirewall) SetupMonitFirewall() error {
 	f.logger.Info(f.logTag, "Setting up monit firewall rules (UID-based matching)")
 
@@ -133,19 +156,12 @@ func (f *NftablesFirewall) SetupMonitFirewall() error {
 	// Create monit chain
 	f.ensureMonitChain()
 
-	// Flush existing agent rules to ensure idempotency on restart
-	f.conn.FlushChain(f.monitChain)
+	// Converge to desired state (preserves job-inserted rules)
+	if err := f.convergeMonitRules(); err != nil {
+		return bosherr.WrapError(err, "Converging monit rules")
+	}
 
-	// Add jump to jobs chain first (so job rules are checked before agent rules)
-	f.addJumpToJobsChain()
-
-	// Add allow rule for root (UID 0)
-	f.addMonitAllowRule()
-
-	// Add block rule for everyone else
-	f.addMonitBlockRule()
-
-	// Commit all rules
+	// Commit all changes
 	if err := f.conn.Flush(); err != nil {
 		return bosherr.WrapError(err, "Flushing nftables rules")
 	}
@@ -232,13 +248,13 @@ func (f *NftablesFirewall) ensureMonitChain() {
 
 // ensureMonitJobsChain creates a regular chain (no hook) for job-managed rules.
 // This chain is never flushed by the agent, allowing job rules to persist across agent restarts.
-// Jobs can add rules to this chain via pre-start scripts using the nft CLI.
+// Jobs can add rules to this chain via pre-start scripts using the nft CLI or bosh-monit-access helper.
 func (f *NftablesFirewall) ensureMonitJobsChain() {
 	f.monitJobsChain = &nftables.Chain{
 		Name:  MonitJobsChainName,
 		Table: f.table,
 		// No Type, Hooknum, Priority, or Policy - this is a regular chain
-		// that can only be reached via jump from monit_access
+		// that can only be reached via jump from monit_output
 	}
 	f.conn.AddChain(f.monitJobsChain)
 }
@@ -257,45 +273,183 @@ func (f *NftablesFirewall) ensureNATSChain() {
 	f.conn.AddChain(f.natsChain)
 }
 
-func (f *NftablesFirewall) addMonitAllowRule() {
-	// Rule: meta skuid 0 ip daddr 127.0.0.1 tcp dport 2822 accept
+// desiredRule represents a rule that the agent wants to have in the chain
+type desiredRule struct {
+	exprs    []expr.Any
+	position string // "first" (insert at beginning) or "last" (append at end)
+}
+
+// convergeMonitRules implements a declarative state converger that:
+// 1. Gets current rules in the chain
+// 2. Identifies agent-managed rules (by UserData marker)
+// 3. Compares against desired state
+// 4. Only adds/removes rules as needed, preserving job-inserted rules
+func (f *NftablesFirewall) convergeMonitRules() error {
+	// Get current rules in chain
+	currentRules, err := f.conn.GetRules(f.table, f.monitChain)
+	if err != nil {
+		// Chain might not exist yet or be empty, treat as empty
+		f.logger.Debug(f.logTag, "Could not get current rules (chain may be new): %s", err)
+		currentRules = []*nftables.Rule{}
+	}
+
+	// Build desired state
+	desired := f.buildDesiredMonitRules()
+
+	// Separate agent rules from job rules
+	var agentRules []*nftables.Rule
+	for _, r := range currentRules {
+		if isAgentRule(r) {
+			agentRules = append(agentRules, r)
+		}
+	}
+
+	// Check if current agent rules match desired state (quick path)
+	if f.agentRulesMatchDesired(agentRules, desired) {
+		f.logger.Debug(f.logTag, "Monit rules already in desired state, no changes needed")
+		return nil
+	}
+
+	f.logger.Debug(f.logTag, "Monit rules need updating, converging to desired state")
+
+	// Delete all existing agent rules (they will be recreated)
+	for _, r := range agentRules {
+		if err := f.conn.DelRule(r); err != nil {
+			f.logger.Warn(f.logTag, "Failed to delete agent rule (handle %d): %s", r.Handle, err)
+		}
+	}
+
+	// Add desired rules in correct order
+	// Process "first" rules in reverse order (since InsertRule prepends)
+	// Then process "last" rules in order (since AddRule appends)
+	var firstRules, lastRules []desiredRule
+	for _, d := range desired {
+		if d.position == "first" {
+			firstRules = append(firstRules, d)
+		} else {
+			lastRules = append(lastRules, d)
+		}
+	}
+
+	// Insert "first" rules in reverse order so they end up in correct order
+	for i := len(firstRules) - 1; i >= 0; i-- {
+		f.insertMarkedRule(firstRules[i].exprs)
+	}
+
+	// Append "last" rules in order
+	for _, d := range lastRules {
+		f.addMarkedRule(d.exprs)
+	}
+
+	return nil
+}
+
+// buildDesiredMonitRules returns the desired state of agent-managed rules
+// The order is:
+//  1. Jump to monit_output_jobs chain (so job rules are checked first)
+//  2. Allow UID 0 (root) access
+//  3. Drop all other access (at end)
+func (f *NftablesFirewall) buildDesiredMonitRules() []desiredRule {
+	return []desiredRule{
+		{
+			exprs:    f.buildJumpToJobsChainExprs(),
+			position: "first",
+		},
+		{
+			exprs:    f.buildMonitAllowExprs(),
+			position: "first",
+		},
+		{
+			exprs:    f.buildMonitBlockExprs(),
+			position: "last",
+		},
+	}
+}
+
+// buildJumpToJobsChainExprs creates expressions for jumping to the jobs chain
+func (f *NftablesFirewall) buildJumpToJobsChainExprs() []expr.Any {
+	return []expr.Any{
+		&expr.Verdict{
+			Kind:  expr.VerdictJump,
+			Chain: MonitJobsChainName,
+		},
+	}
+}
+
+// buildMonitAllowExprs creates expressions for allowing UID 0 access to monit
+func (f *NftablesFirewall) buildMonitAllowExprs() []expr.Any {
 	exprs := f.buildUIDMatchExprs(0)
 	exprs = append(exprs, f.buildLoopbackDestExprs()...)
 	exprs = append(exprs, f.buildTCPDestPortExprs(MonitPort)...)
 	exprs = append(exprs, &expr.Verdict{Kind: expr.VerdictAccept})
-
-	f.conn.AddRule(&nftables.Rule{
-		Table: f.table,
-		Chain: f.monitChain,
-		Exprs: exprs,
-	})
+	return exprs
 }
 
-func (f *NftablesFirewall) addMonitBlockRule() {
-	// Rule: ip daddr 127.0.0.1 tcp dport 2822 drop
+// buildMonitBlockExprs creates expressions for blocking all other access to monit
+func (f *NftablesFirewall) buildMonitBlockExprs() []expr.Any {
 	exprs := f.buildLoopbackDestExprs()
 	exprs = append(exprs, f.buildTCPDestPortExprs(MonitPort)...)
 	exprs = append(exprs, &expr.Verdict{Kind: expr.VerdictDrop})
+	return exprs
+}
 
-	f.conn.AddRule(&nftables.Rule{
-		Table: f.table,
-		Chain: f.monitChain,
-		Exprs: exprs,
+// isAgentRule checks if a rule was created by the bosh-agent
+func isAgentRule(r *nftables.Rule) bool {
+	return string(r.UserData) == AgentRuleMarker
+}
+
+// agentRulesMatchDesired checks if current agent rules match the desired state
+func (f *NftablesFirewall) agentRulesMatchDesired(agentRules []*nftables.Rule, desired []desiredRule) bool {
+	if len(agentRules) != len(desired) {
+		return false
+	}
+
+	// Check that all desired rules exist in current agent rules
+	for _, d := range desired {
+		found := false
+		for _, r := range agentRules {
+			if f.exprsEqual(r.Exprs, d.exprs) {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return false
+		}
+	}
+	return true
+}
+
+// exprsEqual compares two expression slices for equality
+func (f *NftablesFirewall) exprsEqual(a, b []expr.Any) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if !reflect.DeepEqual(a[i], b[i]) {
+			return false
+		}
+	}
+	return true
+}
+
+// insertMarkedRule inserts a rule at the beginning of the chain with agent marker
+func (f *NftablesFirewall) insertMarkedRule(exprs []expr.Any) {
+	f.conn.InsertRule(&nftables.Rule{
+		Table:    f.table,
+		Chain:    f.monitChain,
+		Exprs:    exprs,
+		UserData: []byte(AgentRuleMarker),
 	})
 }
 
-// addJumpToJobsChain adds a jump rule to the monit_access_jobs chain.
-// This must be the first rule in monit_access so job rules are evaluated first.
-func (f *NftablesFirewall) addJumpToJobsChain() {
+// addMarkedRule appends a rule at the end of the chain with agent marker
+func (f *NftablesFirewall) addMarkedRule(exprs []expr.Any) {
 	f.conn.AddRule(&nftables.Rule{
-		Table: f.table,
-		Chain: f.monitChain,
-		Exprs: []expr.Any{
-			&expr.Verdict{
-				Kind:  expr.VerdictJump,
-				Chain: MonitJobsChainName,
-			},
-		},
+		Table:    f.table,
+		Chain:    f.monitChain,
+		Exprs:    exprs,
+		UserData: []byte(AgentRuleMarker),
 	})
 }
 

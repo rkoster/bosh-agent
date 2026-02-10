@@ -30,121 +30,262 @@ var _ = Describe("NftablesFirewall", func() {
 		fakeResolver = &firewallfakes.FakeDNSResolver{}
 		logger = boshlog.NewWriterLogger(boshlog.LevelDebug, GinkgoWriter)
 		manager = firewall.NewNftablesFirewallWithDeps(fakeConn, fakeResolver, logger)
+
+		// Default: GetRules returns empty (no existing rules)
+		fakeConn.GetRulesReturns([]*nftables.Rule{}, nil)
 	})
 
 	Describe("SetupMonitFirewall", func() {
-		It("creates table, chains, and rules successfully", func() {
-			err := manager.SetupMonitFirewall()
-			Expect(err).NotTo(HaveOccurred())
-
-			Expect(fakeConn.AddTableCallCount()).To(Equal(1))
-			Expect(fakeConn.AddChainCallCount()).To(Equal(2)) // jobs chain + monit chain
-			Expect(fakeConn.FlushChainCallCount()).To(Equal(1))
-			Expect(fakeConn.AddRuleCallCount()).To(Equal(3)) // jump + allow + block
-			Expect(fakeConn.FlushCallCount()).To(Equal(1))
-		})
-
-		It("creates table with correct configuration", func() {
-			err := manager.SetupMonitFirewall()
-			Expect(err).NotTo(HaveOccurred())
-
-			table := fakeConn.AddTableArgsForCall(0)
-			Expect(table.Name).To(Equal("bosh_agent"))
-			Expect(table.Family).To(Equal(nftables.TableFamilyINet))
-		})
-
-		It("creates jobs chain as regular chain (no hook)", func() {
-			err := manager.SetupMonitFirewall()
-			Expect(err).NotTo(HaveOccurred())
-
-			// First chain is the jobs chain
-			jobsChain := fakeConn.AddChainArgsForCall(0)
-			Expect(jobsChain.Name).To(Equal("monit_access_jobs"))
-			Expect(jobsChain.Type).To(Equal(nftables.ChainType(""))) // Regular chain has no type
-			Expect(jobsChain.Hooknum).To(BeNil())                    // Regular chain has no hook
-			Expect(jobsChain.Priority).To(BeNil())                   // Regular chain has no priority
-		})
-
-		It("creates monit chain with correct configuration", func() {
-			err := manager.SetupMonitFirewall()
-			Expect(err).NotTo(HaveOccurred())
-
-			// Second chain is the monit chain (base chain with hook)
-			monitChain := fakeConn.AddChainArgsForCall(1)
-			Expect(monitChain.Name).To(Equal("monit_access"))
-			Expect(monitChain.Type).To(Equal(nftables.ChainTypeFilter))
-			Expect(monitChain.Hooknum).NotTo(BeNil())
-			Expect(*monitChain.Hooknum).To(Equal(*nftables.ChainHookOutput))
-		})
-
-		It("adds jump to jobs chain as first rule", func() {
-			err := manager.SetupMonitFirewall()
-			Expect(err).NotTo(HaveOccurred())
-
-			// First rule should be the jump rule
-			jumpRule := fakeConn.AddRuleArgsForCall(0)
-			Expect(jumpRule.Chain.Name).To(Equal("monit_access"))
-			Expect(jumpRule.Exprs).To(HaveLen(1))
-
-			verdict, ok := jumpRule.Exprs[0].(*expr.Verdict)
-			Expect(ok).To(BeTrue())
-			Expect(verdict.Kind).To(Equal(expr.VerdictJump))
-			Expect(verdict.Chain).To(Equal("monit_access_jobs"))
-		})
-
-		It("adds allow rule for UID 0 after jump rule", func() {
-			err := manager.SetupMonitFirewall()
-			Expect(err).NotTo(HaveOccurred())
-
-			// Second rule should be the allow rule (has UID match expressions)
-			allowRule := fakeConn.AddRuleArgsForCall(1)
-			Expect(allowRule.Chain.Name).To(Equal("monit_access"))
-			// The allow rule has more expressions (UID match + loopback + port + accept)
-			// Block rule has fewer (loopback + port + drop)
-			blockRule := fakeConn.AddRuleArgsForCall(2)
-			Expect(len(allowRule.Exprs)).To(BeNumerically(">", len(blockRule.Exprs)))
-		})
-
-		It("flushes monit chain before adding rules", func() {
-			err := manager.SetupMonitFirewall()
-			Expect(err).NotTo(HaveOccurred())
-
-			Expect(fakeConn.FlushChainCallCount()).To(Equal(1))
-			flushedChain := fakeConn.FlushChainArgsForCall(0)
-			Expect(flushedChain.Name).To(Equal("monit_access"))
-		})
-
-		It("never flushes jobs chain to preserve job-managed rules", func() {
-			// Call SetupMonitFirewall multiple times to simulate agent restarts
-			for i := 0; i < 3; i++ {
+		Context("on fresh install (no existing rules)", func() {
+			It("creates table, chains, and rules successfully", func() {
 				err := manager.SetupMonitFirewall()
 				Expect(err).NotTo(HaveOccurred())
-			}
 
-			// Verify that all FlushChain calls were on monit_access, never on monit_access_jobs
-			flushCount := fakeConn.FlushChainCallCount()
-			Expect(flushCount).To(Equal(3)) // Once per call
+				Expect(fakeConn.AddTableCallCount()).To(Equal(1))
+				Expect(fakeConn.AddChainCallCount()).To(Equal(2)) // monit_output_jobs + monit_output
+				Expect(fakeConn.GetRulesCallCount()).To(Equal(1))
+				// 2 InsertRule (jump + allow) + 1 AddRule (block)
+				Expect(fakeConn.InsertRuleCallCount()).To(Equal(2))
+				Expect(fakeConn.AddRuleCallCount()).To(Equal(1))
+				Expect(fakeConn.FlushCallCount()).To(Equal(1))
+			})
 
-			for i := 0; i < flushCount; i++ {
-				flushedChain := fakeConn.FlushChainArgsForCall(i)
-				Expect(flushedChain.Name).To(Equal("monit_access"),
-					"FlushChain should only be called on monit_access, not monit_access_jobs")
-			}
-		})
-
-		Context("when called multiple times", func() {
-			It("flushes monit chain each time to prevent duplicate rules", func() {
+			It("creates table with correct configuration", func() {
 				err := manager.SetupMonitFirewall()
 				Expect(err).NotTo(HaveOccurred())
-				Expect(fakeConn.FlushChainCallCount()).To(Equal(1))
 
-				err = manager.SetupMonitFirewall()
+				table := fakeConn.AddTableArgsForCall(0)
+				Expect(table.Name).To(Equal("filter"))
+				Expect(table.Family).To(Equal(nftables.TableFamilyINet))
+			})
+
+			It("creates monit chain with correct configuration", func() {
+				err := manager.SetupMonitFirewall()
 				Expect(err).NotTo(HaveOccurred())
-				Expect(fakeConn.FlushChainCallCount()).To(Equal(2))
 
-				// Both flush calls should be on the monit chain, not the jobs chain
-				Expect(fakeConn.FlushChainArgsForCall(0).Name).To(Equal("monit_access"))
-				Expect(fakeConn.FlushChainArgsForCall(1).Name).To(Equal("monit_access"))
+				// First chain is monit_output_jobs (regular chain, no hook)
+				jobsChain := fakeConn.AddChainArgsForCall(0)
+				Expect(jobsChain.Name).To(Equal("monit_output_jobs"))
+				Expect(jobsChain.Type).To(Equal(nftables.ChainType(""))) // Regular chain has no type
+
+				// Second chain is monit_output (base chain with hook)
+				monitChain := fakeConn.AddChainArgsForCall(1)
+				Expect(monitChain.Name).To(Equal("monit_output"))
+				Expect(monitChain.Type).To(Equal(nftables.ChainTypeFilter))
+				Expect(monitChain.Hooknum).NotTo(BeNil())
+				Expect(*monitChain.Hooknum).To(Equal(*nftables.ChainHookOutput))
+			})
+
+			It("inserts jump rule and allow rule at beginning of chain", func() {
+				err := manager.SetupMonitFirewall()
+				Expect(err).NotTo(HaveOccurred())
+
+				// First InsertRule call is the allow rule (inserted second, so becomes index 1)
+				// Second InsertRule call is the jump rule (inserted first, so becomes index 0)
+				// Note: InsertRule prepends, so rules are processed in reverse order
+				Expect(fakeConn.InsertRuleCallCount()).To(Equal(2))
+
+				// Jump rule (inserted last, so it's the first rule)
+				jumpRule := fakeConn.InsertRuleArgsForCall(1)
+				Expect(jumpRule.Chain.Name).To(Equal("monit_output"))
+				Expect(len(jumpRule.Exprs)).To(Equal(1))
+				verdict, ok := jumpRule.Exprs[0].(*expr.Verdict)
+				Expect(ok).To(BeTrue())
+				Expect(verdict.Kind).To(Equal(expr.VerdictJump))
+				Expect(verdict.Chain).To(Equal("monit_output_jobs"))
+
+				// Allow rule (inserted first, so it becomes second rule)
+				allowRule := fakeConn.InsertRuleArgsForCall(0)
+				Expect(allowRule.Chain.Name).To(Equal("monit_output"))
+				// Allow rule has UID match + loopback + port + accept
+				Expect(len(allowRule.Exprs)).To(BeNumerically(">", 5))
+
+				// Last expression should be accept verdict
+				acceptVerdict, ok := allowRule.Exprs[len(allowRule.Exprs)-1].(*expr.Verdict)
+				Expect(ok).To(BeTrue())
+				Expect(acceptVerdict.Kind).To(Equal(expr.VerdictAccept))
+			})
+
+			It("marks all agent rules with UserData", func() {
+				err := manager.SetupMonitFirewall()
+				Expect(err).NotTo(HaveOccurred())
+
+				// Check all InsertRule calls have marker
+				for i := 0; i < fakeConn.InsertRuleCallCount(); i++ {
+					rule := fakeConn.InsertRuleArgsForCall(i)
+					Expect(string(rule.UserData)).To(Equal("bosh-agent"))
+				}
+
+				// Check AddRule calls have marker
+				for i := 0; i < fakeConn.AddRuleCallCount(); i++ {
+					rule := fakeConn.AddRuleArgsForCall(i)
+					Expect(string(rule.UserData)).To(Equal("bosh-agent"))
+				}
+			})
+
+			It("adds block rule at end of chain", func() {
+				err := manager.SetupMonitFirewall()
+				Expect(err).NotTo(HaveOccurred())
+
+				// Block rule is added (appended) to be last
+				blockRule := fakeConn.AddRuleArgsForCall(0)
+				Expect(blockRule.Chain.Name).To(Equal("monit_output"))
+
+				// Last expression should be drop verdict
+				verdict, ok := blockRule.Exprs[len(blockRule.Exprs)-1].(*expr.Verdict)
+				Expect(ok).To(BeTrue())
+				Expect(verdict.Kind).To(Equal(expr.VerdictDrop))
+			})
+		})
+
+		Context("when rules already exist and match desired state", func() {
+			BeforeEach(func() {
+				// Simulate existing agent rules that match desired state
+				existingRules := []*nftables.Rule{
+					{
+						Handle:   1,
+						UserData: []byte("bosh-agent"),
+						Exprs:    buildJumpExprs(),
+					},
+					{
+						Handle:   2,
+						UserData: []byte("bosh-agent"),
+						Exprs:    buildAllowExprs(),
+					},
+					{
+						Handle:   3,
+						UserData: []byte("bosh-agent"),
+						Exprs:    buildBlockExprs(),
+					},
+				}
+				fakeConn.GetRulesReturns(existingRules, nil)
+			})
+
+			It("does not modify rules (idempotent)", func() {
+				err := manager.SetupMonitFirewall()
+				Expect(err).NotTo(HaveOccurred())
+
+				// Should not delete or add any rules
+				Expect(fakeConn.DelRuleCallCount()).To(Equal(0))
+				Expect(fakeConn.InsertRuleCallCount()).To(Equal(0))
+				Expect(fakeConn.AddRuleCallCount()).To(Equal(0))
+			})
+		})
+
+		Context("when job rules exist alongside agent rules", func() {
+			BeforeEach(func() {
+				// Simulate agent rules + a job rule (no UserData marker)
+				existingRules := []*nftables.Rule{
+					{
+						Handle:   1,
+						UserData: []byte("bosh-agent"),
+						Exprs:    buildJumpExprs(),
+					},
+					{
+						Handle:   2,
+						UserData: []byte("bosh-agent"),
+						Exprs:    buildAllowExprs(),
+					},
+					{
+						Handle:   3,
+						UserData: nil, // Job rule - no marker
+						Exprs: []expr.Any{
+							// Some job-specific expressions (e.g., cgroup match)
+							&expr.Verdict{Kind: expr.VerdictAccept},
+						},
+					},
+					{
+						Handle:   4,
+						UserData: []byte("bosh-agent"),
+						Exprs:    buildBlockExprs(),
+					},
+				}
+				fakeConn.GetRulesReturns(existingRules, nil)
+			})
+
+			It("preserves job rules and does not modify agent rules when matching", func() {
+				err := manager.SetupMonitFirewall()
+				Expect(err).NotTo(HaveOccurred())
+
+				// Should not delete job rule (handle 3)
+				// Agent rules match, so no changes needed
+				Expect(fakeConn.DelRuleCallCount()).To(Equal(0))
+				Expect(fakeConn.InsertRuleCallCount()).To(Equal(0))
+				Expect(fakeConn.AddRuleCallCount()).To(Equal(0))
+			})
+		})
+
+		Context("when agent rules are missing but job rules exist", func() {
+			BeforeEach(func() {
+				// Only a job rule exists, no agent rules
+				existingRules := []*nftables.Rule{
+					{
+						Handle:   1,
+						UserData: nil, // Job rule
+						Exprs: []expr.Any{
+							&expr.Verdict{Kind: expr.VerdictAccept},
+						},
+					},
+				}
+				fakeConn.GetRulesReturns(existingRules, nil)
+			})
+
+			It("adds agent rules while preserving job rules", func() {
+				err := manager.SetupMonitFirewall()
+				Expect(err).NotTo(HaveOccurred())
+
+				// Should not delete the job rule
+				Expect(fakeConn.DelRuleCallCount()).To(Equal(0))
+
+				// Should add all agent rules: 2 InsertRule (jump + allow) + 1 AddRule (block)
+				Expect(fakeConn.InsertRuleCallCount()).To(Equal(2))
+				Expect(fakeConn.AddRuleCallCount()).To(Equal(1))
+			})
+		})
+
+		Context("when agent rules have changed (need update)", func() {
+			BeforeEach(func() {
+				// Old agent rules that don't match current desired state
+				existingRules := []*nftables.Rule{
+					{
+						Handle:   1,
+						UserData: []byte("bosh-agent"),
+						Exprs: []expr.Any{
+							// Old/different expressions
+							&expr.Verdict{Kind: expr.VerdictDrop},
+						},
+					},
+				}
+				fakeConn.GetRulesReturns(existingRules, nil)
+			})
+
+			It("deletes old agent rules and adds new ones", func() {
+				err := manager.SetupMonitFirewall()
+				Expect(err).NotTo(HaveOccurred())
+
+				// Should delete the old agent rule
+				Expect(fakeConn.DelRuleCallCount()).To(Equal(1))
+				deletedRule := fakeConn.DelRuleArgsForCall(0)
+				Expect(deletedRule.Handle).To(Equal(uint64(1)))
+
+				// Should add all new agent rules: 2 InsertRule (jump + allow) + 1 AddRule (block)
+				Expect(fakeConn.InsertRuleCallCount()).To(Equal(2))
+				Expect(fakeConn.AddRuleCallCount()).To(Equal(1))
+			})
+		})
+
+		Context("when GetRules fails", func() {
+			BeforeEach(func() {
+				fakeConn.GetRulesReturns(nil, errors.New("chain not found"))
+			})
+
+			It("treats as empty and adds all rules", func() {
+				err := manager.SetupMonitFirewall()
+				Expect(err).NotTo(HaveOccurred())
+
+				// Should add all agent rules: 2 InsertRule (jump + allow) + 1 AddRule (block)
+				Expect(fakeConn.InsertRuleCallCount()).To(Equal(2))
+				Expect(fakeConn.AddRuleCallCount()).To(Equal(1))
 			})
 		})
 
@@ -178,7 +319,7 @@ var _ = Describe("NftablesFirewall", func() {
 				Expect(err).NotTo(HaveOccurred())
 
 				chain := fakeConn.AddChainArgsForCall(0)
-				Expect(chain.Name).To(Equal("nats_access"))
+				Expect(chain.Name).To(Equal("nats_output"))
 				Expect(chain.Type).To(Equal(nftables.ChainTypeFilter))
 				Expect(chain.Hooknum).To(Equal(nftables.ChainHookOutput))
 			})
@@ -319,3 +460,40 @@ var _ = Describe("NftablesFirewall", func() {
 		})
 	})
 })
+
+// Helper functions to build expected expressions for tests
+func buildJumpExprs() []expr.Any {
+	return []expr.Any{
+		&expr.Verdict{Kind: expr.VerdictJump, Chain: "monit_output_jobs"},
+	}
+}
+
+func buildAllowExprs() []expr.Any {
+	return []expr.Any{
+		&expr.Meta{Key: expr.MetaKeySKUID, Register: 1},
+		&expr.Cmp{Op: expr.CmpOpEq, Register: 1, Data: []byte{0, 0, 0, 0}},
+		&expr.Meta{Key: expr.MetaKeyNFPROTO, Register: 1},
+		&expr.Cmp{Op: expr.CmpOpEq, Register: 1, Data: []byte{2}},
+		&expr.Payload{DestRegister: 1, Base: expr.PayloadBaseNetworkHeader, Offset: 16, Len: 4},
+		&expr.Cmp{Op: expr.CmpOpEq, Register: 1, Data: []byte{127, 0, 0, 1}},
+		&expr.Meta{Key: expr.MetaKeyL4PROTO, Register: 1},
+		&expr.Cmp{Op: expr.CmpOpEq, Register: 1, Data: []byte{6}},
+		&expr.Payload{DestRegister: 1, Base: expr.PayloadBaseTransportHeader, Offset: 2, Len: 2},
+		&expr.Cmp{Op: expr.CmpOpEq, Register: 1, Data: []byte{0x0b, 0x06}},
+		&expr.Verdict{Kind: expr.VerdictAccept},
+	}
+}
+
+func buildBlockExprs() []expr.Any {
+	return []expr.Any{
+		&expr.Meta{Key: expr.MetaKeyNFPROTO, Register: 1},
+		&expr.Cmp{Op: expr.CmpOpEq, Register: 1, Data: []byte{2}},
+		&expr.Payload{DestRegister: 1, Base: expr.PayloadBaseNetworkHeader, Offset: 16, Len: 4},
+		&expr.Cmp{Op: expr.CmpOpEq, Register: 1, Data: []byte{127, 0, 0, 1}},
+		&expr.Meta{Key: expr.MetaKeyL4PROTO, Register: 1},
+		&expr.Cmp{Op: expr.CmpOpEq, Register: 1, Data: []byte{6}},
+		&expr.Payload{DestRegister: 1, Base: expr.PayloadBaseTransportHeader, Offset: 2, Len: 2},
+		&expr.Cmp{Op: expr.CmpOpEq, Register: 1, Data: []byte{0x0b, 0x06}},
+		&expr.Verdict{Kind: expr.VerdictDrop},
+	}
+}
